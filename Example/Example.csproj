@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <LangVersion>14</LangVersion>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>FunctionTest</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\NicolaySerialSFM3x00\NicolaySerialSFM3x00.csproj" />
+    </ItemGroup>
+
+</Project>
