@@ -7,6 +7,10 @@ var device = new SfmDevice("/dev/ttyUSB0");
 device.Connect();
 
 device.Check();
+await Task.Delay(1000);
 
-await Task.Delay(2000);
+var result = await device.GetValue();
+Console.WriteLine("Measurement: " + result);
+
+await Task.Delay(5000);
 Console.WriteLine("Finished");
