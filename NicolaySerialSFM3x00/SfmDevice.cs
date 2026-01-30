@@ -11,7 +11,7 @@ namespace NicolaySerialSFM3x00
         
         private SerialPort _serialPort;
         private readonly byte[] _rxBuffer = new byte[4086];
-        private TaskCompletionSource<float> _measurementTcs;
+        private TaskCompletionSource<int> _measurementTcs;
 
         private readonly RxParser _rxParser;
 
@@ -37,10 +37,10 @@ namespace NicolaySerialSFM3x00
             SendCommand(0x05, Array.Empty<byte>());
         }
 
-        public async Task<float> GetValue()
+        public async Task<int> GetValue()
         {
-            _measurementTcs = new TaskCompletionSource<float>();
-            SendCommand(0x10, Array.Empty<byte>());
+            _measurementTcs = new TaskCompletionSource<int>();
+            SendCommand(0x11, Array.Empty<byte>());
             return await _measurementTcs.Task;
         }
 
@@ -54,20 +54,13 @@ namespace NicolaySerialSFM3x00
         private void OnParsed(byte[] message)
         {
             if (message.Length < 4) return;
-            Console.WriteLine("Received Data: " + BitConverter.ToString(message));
+            // Console.WriteLine("Received Data: " + BitConverter.ToString(message));
             
-            if (message[1] == 0x10 && message.Length == 8)
+            if (message[1] == 0x11 && message.Length == 6)
             {
                 // Measurement response
-                // Bytes 3-6 are a 32-bit signed float
-                // float value = BitConverter.ToSingle(message[3..7]);
-                Span<byte> stackSpan = stackalloc byte[4];
-                stackSpan[0] = message[6];
-                stackSpan[1] = message[5];
-                stackSpan[2] = message[4];
-                stackSpan[3] = message[3];
-                float value = BitConverter.ToSingle(stackSpan);
-                _measurementTcs?.SetResult(value);
+                var rawValue = (message[4] << 8) | message[3];
+                _measurementTcs?.SetResult(rawValue);
                 return;
             }
             
