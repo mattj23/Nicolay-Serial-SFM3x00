@@ -1,3 +1,5 @@
+name: Publish to NuGet
+
 on:
   push:
     tags:
@@ -8,7 +10,11 @@ jobs:
     timeout-minutes: 15
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
     - name: Verify commit exists in origin/main
       run: |
         git fetch --no-tags --prune --depth=1 origin +refs/heads/*:refs/remotes/origin/*
@@ -16,9 +22,11 @@ jobs:
     - name: Set VERSION variable from tag
       run: echo "VERSION=${GITHUB_REF/refs\/tags\/v/}" >> $GITHUB_ENV
     - name: Build
-      run: dotnet build --configuration Release /p:Version=${VERSION} 
+      run: dotnet build --configuration Release /p:Version=${VERSION}
+    - name: Test
+      run: dotnet test --configuration Release --no-build
     - name: Pack
-      run: dotnet pack --configuration Release /p:Version=${VERSION} --no-build --output . 
+      run: dotnet pack NicolaySerialSFM3x00/NicolaySerialSFM3x00.csproj --configuration Release /p:Version=${VERSION} --no-build --output .
     - name: Push
       run: dotnet nuget push NicolaySerialSFM3x00.${VERSION}.nupkg --api-key ${NUGET_API_KEY} --source https://api.nuget.org/v3/index.json
       env:

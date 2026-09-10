@@ -1,26 +1,38 @@
 using System;
+using System.IO;
 using System.IO.Ports;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace NicolaySerialSFM3x00
 {
-    public class SfmDevice : IDisposable, IAsyncDisposable
+    /// <summary>
+    /// Communicates with a Nicolay flow meter through a serial port.
+    /// </summary>
+    /// <remarks>
+    /// The device processes one request at a time, so requests are serialized. A request that goes
+    /// unanswered within its timeout resynchronizes the parser and throws
+    /// <see cref="SfmTimeoutException"/> rather than waiting indefinitely.
+    /// </remarks>
+    public partial class SfmDevice : IDisposable, IAsyncDisposable
     {
-        private readonly string _portName;
-        private readonly byte _address;
-        
-        private SerialPort _serialPort;
-        private readonly RxParser _rxParser;
-        
-        // Signals and tasks for starting/stopping the serial communication
-        private readonly CancellationTokenSource _cts = new();
-        private TaskCompletionSource<bool> _stopReadTcs;
-        private TaskCompletionSource<bool> _startTcs;
+        /// <summary>The baud rate the device uses after power on.</summary>
+        public const int DefaultBaudRate = 115200;
 
-        // Task completion sources for response requests
-        private TaskCompletionSource<int> _measurementTcs;
-        private TaskCompletionSource<bool> _checkTcs;
+        private readonly string? _portName;
+        private readonly byte _address;
+        private readonly RxParser _rxParser;
+
+        private readonly CancellationTokenSource _cts = new();
+
+        // The device serves one request at a time, so one pending-request slot is sufficient.
+        private readonly SemaphoreSlim _requestLock = new(1, 1);
+        private TaskCompletionSource<byte[]>? _pending;
+        private byte _pendingCommand;
+
+        private SerialPort? _serialPort;
+        private Stream? _stream;
+        private Task? _readTask;
 
         public SfmDevice(string portName, byte address = 0x01)
         {
@@ -29,153 +41,226 @@ namespace NicolaySerialSFM3x00
             _rxParser = new RxParser(OnParsed);
         }
 
+        /// <summary>
+        /// Creates a device that communicates through an open stream for tests that do not use
+        /// hardware.
+        /// </summary>
+        internal SfmDevice(Stream stream, byte address = 0x01)
+        {
+            _portName = null;
+            _address = address;
+            _stream = stream;
+            _rxParser = new RxParser(OnParsed);
+        }
+
+        /// <summary>
+        /// The time to wait for a response, in milliseconds. Individual requests can override
+        /// this value.
+        /// </summary>
+        public int DefaultTimeoutMs { get; set; } = 250;
+
+        /// <summary>The device address on the bus.</summary>
+        public byte Address => _address;
+
+        /// <summary>Whether the port is open and the read loop is running.</summary>
+        public bool IsConnected => _readTask != null;
+
+        /// <summary>
+        /// Raised when the read loop stops because of an unexpected error, such as the port being
+        /// removed. Any request in flight fails with the same error.
+        /// </summary>
+        public event EventHandler<Exception>? ReadFault;
+
+        /// <summary>
+        /// Opens the configured serial port, if necessary, and begins reading from the device.
+        /// </summary>
         public Task Connect()
         {
-            if (_startTcs != null)
+            if (IsConnected)
             {
                 throw new InvalidOperationException("Device is already connected");
             }
-            _startTcs = new TaskCompletionSource<bool>();
-            
-            _serialPort = new SerialPort(_portName, 115200, Parity.None, 8, StopBits.One);
-            _serialPort.Open();
-            
-            // Create long-running background task to read data
-            Task.Factory.StartNew(ReadTask, TaskCreationOptions.LongRunning);
-            return _startTcs.Task;
-        }
-        
-        /// <summary>
-        /// Run the device's test (0x05) command and check the response
-        /// </summary>
-        public Task<bool> Check()
-        {
-            _checkTcs = new TaskCompletionSource<bool>();
-            SendCommand(0x05, Array.Empty<byte>());
-            return _checkTcs.Task;
+
+            if (_portName != null)
+            {
+                _serialPort = new SerialPort(_portName, DefaultBaudRate, Parity.None, 8, StopBits.One);
+                _serialPort.Open();
+                _stream = _serialPort.BaseStream;
+            }
+
+            _readTask = Task.Factory
+                .StartNew(ReadLoop, TaskCreationOptions.LongRunning)
+                .Unwrap();
+
+            return Task.CompletedTask;
         }
 
-        public async Task<int> GetValue()
+        /// <summary>
+        /// Runs the device's test command (0x05) and checks whether it returns the expected pattern.
+        /// </summary>
+        public async Task<bool> Check(int? timeoutMs = null, CancellationToken cancellationToken = default)
         {
-            _measurementTcs = new TaskCompletionSource<int>();
-            SendCommand(0x11, Array.Empty<byte>());
-            return await _measurementTcs.Task;
+            var payload = await ExecuteAsync(0x05, [], timeoutMs, cancellationToken).ConfigureAwait(false);
+            return payload.Length == 2 && payload[0] == 0x55 && payload[1] == 0xAA;
+        }
+
+        /// <summary>
+        /// Sends a request and waits for the device's response. Returns the response data bytes
+        /// without the address, function code, count, or CRC.
+        /// </summary>
+        /// <exception cref="SfmDeviceException">The device rejected the request.</exception>
+        /// <exception cref="SfmTimeoutException">The device did not respond in time.</exception>
+        /// <exception cref="SfmCrcException">The response failed its checksum.</exception>
+        private async Task<byte[]> ExecuteAsync(byte command, byte[] data, int? timeoutMs,
+            CancellationToken cancellationToken)
+        {
+            if (!IsConnected)
+            {
+                throw new InvalidOperationException("Device is not connected");
+            }
+
+            var timeout = timeoutMs ?? DefaultTimeoutMs;
+
+            await _requestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var pending = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _pendingCommand = command;
+                _pending = pending;
+
+                var frame = Protocol.BuildFrame(_address, command, data);
+                _rxParser.EnqueueExpected((ushort)((_address << 8) | command));
+                _stream!.Write(frame, 0, frame.Length);
+
+                using var timeoutCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+                var delay = Task.Delay(timeout, timeoutCts.Token);
+
+                if (await Task.WhenAny(pending.Task, delay).ConfigureAwait(false) == pending.Task)
+                {
+                    timeoutCts.Cancel(); // Stop the timer early.
+                    return await pending.Task.ConfigureAwait(false);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // The response did not arrive. Abandon all data that is still in flight so the
+                // parser can frame the next response correctly.
+                _rxParser.Reset();
+
+                if (_cts.IsCancellationRequested)
+                {
+                    throw new SfmException("The device was disconnected while awaiting a response");
+                }
+
+                throw new SfmTimeoutException(command, timeout);
+            }
+            finally
+            {
+                _pending = null;
+                _requestLock.Release();
+            }
         }
 
         private void OnParsed(byte[] message)
         {
-            if (message[0] != _address) return; // Not for us
-            
-            if (message.Length < 4) return;
-            // Console.WriteLine("Received Data: " + BitConverter.ToString(message));
-            
-            if (message[1] == 0x11 && message.Length == 6)
+            var pending = _pending;
+            if (pending == null) return;
+            if (message.Length < 4 || message[0] != _address) return;
+
+            if (!Protocol.HasValidCrc(message))
             {
-                // Measurement response
-                var rawValue = (message[4] << 8) | message[3];
-                _measurementTcs?.SetResult(rawValue);
+                pending.TrySetException(new SfmCrcException(_pendingCommand));
                 return;
             }
-            
-            if (message[1] == 0x05)
+
+            // An exception frame sets the function code's high bit and contains the reason that
+            // the device refused the request.
+            if (message[1] == (byte)(_pendingCommand | 0x80))
             {
-                if (message.Length != 6) 
-                {
-                    _checkTcs?.SetResult(false);
-                }
-                else
-                {
-                    _checkTcs?.SetResult(message[2] == 0x02 && message[3] == 0x55 && message[4] == 0xAA && message[5] == 0x7D);
-                }
+                pending.TrySetException(new SfmDeviceException(_pendingCommand, message[3]));
                 return;
             }
-            
-        }
-        
-        private void SendCommand(byte command, byte[] data)
-        {
-            int length = 3 + data.Length + 1; // Command + Length + Data + CRC
-            byte[] packet = new byte[length];
-            packet[0] = _address;
-            packet[1] = command;
-            packet[2] = (byte)data.Length;
-            Array.Copy(data, 0, packet, 3, data.Length);
-            packet[length - 1] = Crc8(packet.AsSpan(0, length - 1));
-            
-            var code = (ushort)((_address << 8) | command);
-            _rxParser.EnqueueExpected(code);
-            
-            // Console.WriteLine(BitConverter.ToString(packet));
 
-            _serialPort.Write(packet, 0, length);
-        }
-        
-        private Task StopReading()
-        {
-            if (_stopReadTcs == null) return Task.CompletedTask;
-            _cts.Cancel();
-            return _stopReadTcs.Task;
+            if (message[1] != _pendingCommand) return;
+
+            var payload = new byte[message.Length - 4];
+            Array.Copy(message, 3, payload, 0, payload.Length);
+            pending.TrySetResult(payload);
         }
 
-        private async void ReadTask()
+        private async Task ReadLoop()
         {
-            _stopReadTcs = new TaskCompletionSource<bool>();
-            _startTcs?.TrySetResult(true);
-            
             try
             {
                 var buffer = new byte[1024];
                 while (!_cts.Token.IsCancellationRequested)
                 {
-                    var bytesRead = await _serialPort.BaseStream.ReadAsync(buffer, _cts.Token);
+                    var bytesRead = await _stream!.ReadAsync(buffer, 0, buffer.Length, _cts.Token)
+                        .ConfigureAwait(false);
                     if (bytesRead > 0)
                     {
                         _rxParser.AddBytes(buffer.AsSpan(0, bytesRead));
                     }
                 }
             }
+            catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException
+                                          or IOException && _cts.IsCancellationRequested)
+            {
+                // The read operation stopped during shutdown, so do not report a fault.
+                _streamChannel?.Writer.TryComplete();
+            }
             catch (Exception e)
             {
-                throw; // TODO handle exception
-            }
-            finally
-            {
-                _stopReadTcs.SetResult(true);
-                _stopReadTcs = null;
+                _pending?.TrySetException(e);
+                _streamChannel?.Writer.TryComplete(e);
+                ReadFault?.Invoke(this, e);
             }
         }
-        
-        private static byte Crc8(ReadOnlySpan<byte> data)
+
+        private async Task StopReading()
         {
-            byte crc = 0x00;
-            foreach (var b in data)
+            if (_readTask == null) return;
+
+            _cts.Cancel();
+
+            // Closing the port unblocks a read that the cancellation token could not interrupt.
+            _serialPort?.Close();
+
+            try
             {
-                crc ^= b;
-                for (int i = 0; i < 8; i++)
-                {
-                    if ((crc & 0x80) != 0)
-                        crc = (byte)((crc << 1) ^ 0x31);
-                    else
-                        crc <<= 1;
-                }
+                await _readTask.ConfigureAwait(false);
             }
-            return crc;
+            catch (Exception)
+            {
+                // The read loop reports faults through ReadFault.
+            }
+
+            _readTask = null;
         }
 
-
-        public async void Dispose()
+        public void Dispose()
         {
-            await StopReading();
+            _cts.Cancel();
+            _pending?.TrySetException(new SfmException("The device was disposed"));
             _serialPort?.Close();
             _serialPort?.Dispose();
+            _serialPort = null;
+            _stream = null;
+            _readTask = null;
+            _cts.Dispose();
+            _requestLock.Dispose();
         }
-        
+
         public async ValueTask DisposeAsync()
         {
-            await StopReading();
-            _serialPort?.Close();
+            _pending?.TrySetException(new SfmException("The device was disposed"));
+            await StopReading().ConfigureAwait(false);
             _serialPort?.Dispose();
+            _serialPort = null;
+            _stream = null;
+            _cts.Dispose();
+            _requestLock.Dispose();
         }
-        
     }
 }

@@ -1,12 +1,36 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <TargetFramework>netstandard2.1</TargetFramework>
         <LangVersion>14</LangVersion>
+        <Nullable>enable</Nullable>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <!-- Suppress CS1591 globally; constructors, enum members, and ToString overrides intentionally omit XML comments. -->
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <Description>A .NET library for operating Sensirion SFM3x00 flow meters through a Nicolay serial connector over RS232 or RS485, with support for an optional AMS5915 pressure sensor.</Description>
+        <Authors>Matt Jarvis</Authors>
+        <PackageTags>sensirion;nicolay;sfm3x00;flow-meter;serial;rs485</PackageTags>
+        <RepositoryUrl>https://github.com/mattj23/Nicolay-Serial-SFM3x00</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/mattj23/Nicolay-Serial-SFM3x00</PackageProjectUrl>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <Copyright>Copyright (c) 2026 Matt Jarvis</Copyright>
     </PropertyGroup>
 
     <ItemGroup>
       <PackageReference Include="System.IO.Ports" Version="10.0.1" />
+      <PackageReference Include="System.Threading.Channels" Version="10.0.1" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <InternalsVisibleTo Include="NicolaySerialSFM3x00.Tests" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Include="../README.md" Pack="true" PackagePath="/" />
     </ItemGroup>
 
 </Project>
